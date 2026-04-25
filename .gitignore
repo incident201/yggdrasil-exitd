@@ -1,0 +1,12 @@
+# Built binary
+/ygg-exitd
+
+# Go build artifacts
+*.exe
+*.test
+*.out
+
+# Editor/OS junk
+.DS_Store
+.vscode/
+.idea/
