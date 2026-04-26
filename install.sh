@@ -12,6 +12,7 @@ HELPER_APPLY_NFT="/usr/local/sbin/ygg-exitd-nft-apply"
 HELPER_REMOVE_NFT="/usr/local/sbin/ygg-exitd-nft-remove"
 HELPER_APPLY_ROUTING="/usr/local/sbin/ygg-exitd-routing-apply"
 HELPER_REMOVE_ROUTING="/usr/local/sbin/ygg-exitd-routing-remove"
+HELPER_DOCKER_FW="/usr/local/sbin/ygg-exitd-docker-fw"
 
 CONFIG_DIR="/etc/ygg-exitd"
 ENV_FILE="/etc/ygg-exitd/ygg-exitd.env"
@@ -19,6 +20,7 @@ NFT_FILE="/etc/ygg-exitd/nftables.nft"
 STATE_FILE="/etc/ygg-exitd/install.state"
 WHITELIST_FILE="/etc/ygg-exitd.conf"
 SYSTEMD_UNIT="/etc/systemd/system/ygg-exitd.service"
+DOCKER_FW_UNIT="/etc/systemd/system/ygg-exitd-docker-fw.service"
 SYSCTL_FILE="/etc/sysctl.d/99-ygg-exitd.conf"
 
 LISTEN_PORT_DEFAULT="40001"
@@ -28,6 +30,8 @@ TUN_NET_DEFAULT="10.66.0.0/24"
 TUN_MTU_DEFAULT="1280"
 POLICY_TABLE_DEFAULT="42066"
 POLICY_PRIORITY_DEFAULT="10066"
+
+DOCKER_FW_CONFIGURED="0"
 
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -179,7 +183,8 @@ check_existing_install() {
     for p in \
         "$BIN_PATH" "$RUNNER_PATH" "$ENV_FILE" "$NFT_FILE" "$SYSTEMD_UNIT" \
         "$HELPER_APPLY_NFT" "$HELPER_REMOVE_NFT" \
-        "$HELPER_APPLY_ROUTING" "$HELPER_REMOVE_ROUTING" "$SYSCTL_FILE"; do
+        "$HELPER_APPLY_ROUTING" "$HELPER_REMOVE_ROUTING" \
+        "$HELPER_DOCKER_FW" "$DOCKER_FW_UNIT" "$SYSCTL_FILE"; do
         [[ -e "$p" ]] && found=1
     done
 
@@ -187,6 +192,8 @@ check_existing_install() {
         warn "Похоже, ygg-exitd уже устанавливался на эту систему."
         yesno "Перезаписать файлы установки?" "n" || die "Отменено."
         systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
+        systemctl disable --now ygg-exitd-docker-fw.service >/dev/null 2>&1 || true
+        "$HELPER_DOCKER_FW" remove >/dev/null 2>&1 || true
     fi
 }
 
@@ -416,7 +423,7 @@ while ip rule show | grep -q "from ${TUN_NET:-10.66.0.0/24} lookup ${POLICY_TABL
     ip rule del from "${TUN_NET:-10.66.0.0/24}" table "${POLICY_TABLE:-42066}" priority "${POLICY_PRIORITY:-10066}" 2>/dev/null || \
     ip rule del from "${TUN_NET:-10.66.0.0/24}" table "${POLICY_TABLE:-42066}" 2>/dev/null || \
     break
- done
+done
 ip route flush table "${POLICY_TABLE:-42066}" 2>/dev/null || true
 EOF_REMOVE_ROUTING
 
@@ -482,6 +489,149 @@ EOF_REMOVE_NFT
 
     chmod 0755 "$HELPER_APPLY_NFT" "$HELPER_REMOVE_NFT"
     log "nftables helpers созданы."
+}
+
+write_docker_fw_helper() {
+    cat > "$HELPER_DOCKER_FW" <<'EOF_DOCKER_FW'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+ENV_FILE="/etc/ygg-exitd/ygg-exitd.env"
+[[ -f "$ENV_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+. "$ENV_FILE"
+
+TUN_IFACE="${TUN_NAME:-yggexit0}"
+OUT_IFACE="${OUT_IFACE:-none}"
+TUN_NET="${TUN_NET:-10.66.0.0/24}"
+
+[[ "${ENABLE_NAT:-0}" == "1" ]] || exit 0
+[[ -n "$OUT_IFACE" && "$OUT_IFACE" != "none" ]] || exit 0
+command -v iptables >/dev/null 2>&1 || exit 0
+
+ensure_docker_user_chain() {
+    iptables -N DOCKER-USER 2>/dev/null || true
+    iptables -S DOCKER-USER >/dev/null 2>&1 || return 1
+}
+
+apply_rules() {
+    ensure_docker_user_chain || exit 0
+
+    iptables -C DOCKER-USER \
+        -i "$TUN_IFACE" -o "$OUT_IFACE" \
+        -s "$TUN_NET" \
+        -j ACCEPT 2>/dev/null || \
+    iptables -I DOCKER-USER 1 \
+        -i "$TUN_IFACE" -o "$OUT_IFACE" \
+        -s "$TUN_NET" \
+        -j ACCEPT
+
+    iptables -C DOCKER-USER \
+        -i "$OUT_IFACE" -o "$TUN_IFACE" \
+        -d "$TUN_NET" \
+        -m conntrack --ctstate RELATED,ESTABLISHED \
+        -j ACCEPT 2>/dev/null || \
+    iptables -I DOCKER-USER 2 \
+        -i "$OUT_IFACE" -o "$TUN_IFACE" \
+        -d "$TUN_NET" \
+        -m conntrack --ctstate RELATED,ESTABLISHED \
+        -j ACCEPT
+}
+
+remove_rules() {
+    iptables -S DOCKER-USER >/dev/null 2>&1 || exit 0
+
+    while iptables -C DOCKER-USER \
+        -i "$TUN_IFACE" -o "$OUT_IFACE" \
+        -s "$TUN_NET" \
+        -j ACCEPT 2>/dev/null; do
+        iptables -D DOCKER-USER \
+            -i "$TUN_IFACE" -o "$OUT_IFACE" \
+            -s "$TUN_NET" \
+            -j ACCEPT
+    done
+
+    while iptables -C DOCKER-USER \
+        -i "$OUT_IFACE" -o "$TUN_IFACE" \
+        -d "$TUN_NET" \
+        -m conntrack --ctstate RELATED,ESTABLISHED \
+        -j ACCEPT 2>/dev/null; do
+        iptables -D DOCKER-USER \
+            -i "$OUT_IFACE" -o "$TUN_IFACE" \
+            -d "$TUN_NET" \
+            -m conntrack --ctstate RELATED,ESTABLISHED \
+            -j ACCEPT
+    done
+}
+
+case "${1:-apply}" in
+    apply) apply_rules ;;
+    remove) remove_rules ;;
+    *) echo "Usage: $0 {apply|remove}" >&2; exit 1 ;;
+esac
+EOF_DOCKER_FW
+
+    chmod 0755 "$HELPER_DOCKER_FW"
+    log "Docker firewall helper создан: $HELPER_DOCKER_FW"
+}
+
+docker_firewall_needed() {
+    local enable_nat="$1"
+
+    [[ "$enable_nat" == "1" ]] || return 1
+    cmd_exists iptables || return 1
+
+    if systemctl list-unit-files 2>/dev/null | grep -q '^docker\.service'; then
+        return 0
+    fi
+
+    if iptables -S DOCKER-USER >/dev/null 2>&1; then
+        return 0
+    fi
+
+    return 1
+}
+
+write_docker_fw_systemd_unit() {
+    cat > "$DOCKER_FW_UNIT" <<EOF_UNIT
+[Unit]
+Description=ygg-exitd Docker forwarding compatibility rules
+Documentation=https://github.com/incident201/yggdrasil-exitd
+After=docker.service network-online.target ygg-exitd.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=$HELPER_DOCKER_FW apply
+ExecStop=$HELPER_DOCKER_FW remove
+
+[Install]
+WantedBy=multi-user.target
+EOF_UNIT
+
+    chmod 0644 "$DOCKER_FW_UNIT"
+    systemctl daemon-reload
+    log "systemd unit для Docker firewall создан: $DOCKER_FW_UNIT"
+}
+
+setup_docker_firewall_if_needed() {
+    local enable_nat="$1"
+
+    DOCKER_FW_CONFIGURED="0"
+
+    if ! docker_firewall_needed "$enable_nat"; then
+        rm -f "$DOCKER_FW_UNIT" "$HELPER_DOCKER_FW"
+        return 0
+    fi
+
+    write_docker_fw_helper
+    write_docker_fw_systemd_unit
+
+    systemctl enable --now ygg-exitd-docker-fw.service >/dev/null
+    DOCKER_FW_CONFIGURED="1"
+    log "Добавлены совместимые правила в DOCKER-USER для ygg-exitd."
 }
 
 write_sysctl_file() {
@@ -612,6 +762,7 @@ main() {
     write_systemd_unit
 
     systemctl enable --now "$SERVICE_NAME.service"
+    setup_docker_firewall_if_needed "$enable_nat"
 
     echo
     log "Установка завершена."
@@ -624,6 +775,11 @@ main() {
     echo "  whitelist:    $WHITELIST_FILE"
     echo "  out iface:    $out_iface"
     echo "  nft table:    inet ygg_exitd"
+    if [[ "$DOCKER_FW_CONFIGURED" == "1" ]]; then
+        echo "  docker fw:    enabled via DOCKER-USER"
+    else
+        echo "  docker fw:    not needed / not detected"
+    fi
     echo
     echo "Сейчас whitelist пустой. Добавь Yggdrasil IPv6 клиента в $WHITELIST_FILE и перезапусти сервис:"
     echo "  sudo nano $WHITELIST_FILE"
@@ -632,6 +788,10 @@ main() {
     echo "Проверка:"
     echo "  systemctl status $SERVICE_NAME"
     echo "  journalctl -u $SERVICE_NAME -f"
+    if [[ "$DOCKER_FW_CONFIGURED" == "1" ]]; then
+        echo "  systemctl status ygg-exitd-docker-fw"
+        echo "  sudo iptables -vnL DOCKER-USER"
+    fi
     echo
     echo "Откат:"
     echo "  sudo ./uninstall.sh"
