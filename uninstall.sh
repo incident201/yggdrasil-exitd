@@ -9,11 +9,13 @@ HELPER_APPLY_NFT="/usr/local/sbin/ygg-exitd-nft-apply"
 HELPER_REMOVE_NFT="/usr/local/sbin/ygg-exitd-nft-remove"
 HELPER_APPLY_ROUTING="/usr/local/sbin/ygg-exitd-routing-apply"
 HELPER_REMOVE_ROUTING="/usr/local/sbin/ygg-exitd-routing-remove"
+HELPER_DOCKER_FW="/usr/local/sbin/ygg-exitd-docker-fw"
 CONFIG_DIR="/etc/ygg-exitd"
 ENV_FILE="/etc/ygg-exitd/ygg-exitd.env"
 STATE_FILE="/etc/ygg-exitd/install.state"
 WHITELIST_FILE="/etc/ygg-exitd.conf"
 SYSTEMD_UNIT="/etc/systemd/system/ygg-exitd.service"
+DOCKER_FW_UNIT="/etc/systemd/system/ygg-exitd-docker-fw.service"
 SYSCTL_FILE="/etc/sysctl.d/99-ygg-exitd.conf"
 
 log()  { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
@@ -84,6 +86,50 @@ remove_policy_routing() {
     fi
 }
 
+remove_docker_forwarding_rules() {
+    local tun_name out_iface tun_net
+
+    if [[ -x "$HELPER_DOCKER_FW" ]]; then
+        "$HELPER_DOCKER_FW" remove >/dev/null 2>&1 || true
+    fi
+
+    command -v iptables >/dev/null 2>&1 || return 0
+    iptables -S DOCKER-USER >/dev/null 2>&1 || return 0
+
+    tun_name="$(read_env_value TUN_NAME "$ENV_FILE")"
+    out_iface="$(read_env_value OUT_IFACE "$ENV_FILE")"
+    tun_net="$(read_env_value TUN_NET "$ENV_FILE")"
+
+    [[ -n "$tun_name" ]] || tun_name="yggexit0"
+    [[ -n "$out_iface" ]] || out_iface="none"
+    [[ -n "$tun_net" ]] || tun_net="10.66.0.0/24"
+    [[ "$out_iface" != "none" ]] || return 0
+
+    while iptables -C DOCKER-USER \
+        -i "$tun_name" -o "$out_iface" \
+        -s "$tun_net" \
+        -j ACCEPT 2>/dev/null; do
+        iptables -D DOCKER-USER \
+            -i "$tun_name" -o "$out_iface" \
+            -s "$tun_net" \
+            -j ACCEPT 2>/dev/null || break
+    done
+
+    while iptables -C DOCKER-USER \
+        -i "$out_iface" -o "$tun_name" \
+        -d "$tun_net" \
+        -m conntrack --ctstate RELATED,ESTABLISHED \
+        -j ACCEPT 2>/dev/null; do
+        iptables -D DOCKER-USER \
+            -i "$out_iface" -o "$tun_name" \
+            -d "$tun_net" \
+            -m conntrack --ctstate RELATED,ESTABLISHED \
+            -j ACCEPT 2>/dev/null || break
+    done
+
+    log "Правила ygg-exitd из DOCKER-USER удалены, если были активны."
+}
+
 remove_leftover_tun() {
     local tun_name
     tun_name="$(read_env_value TUN_NAME "$ENV_FILE")"
@@ -117,9 +163,13 @@ restore_ip_forward_if_safe() {
 main() {
     need_root
 
-    warn "Это удалит ygg-exitd, systemd unit, helper scripts, nftables table inet ygg_exitd и /etc/ygg-exitd."
+    warn "Это удалит ygg-exitd, systemd units, helper scripts, nftables table inet ygg_exitd и /etc/ygg-exitd."
+    warn "Также будут удалены только правила ygg-exitd из DOCKER-USER, если install.sh их добавлял. Остальные правила Docker не трогаются."
     warn "Yggdrasil не будет удалён и его конфиг не будет изменён."
     yesno "Продолжить удаление?" "n" || die "Отменено."
+
+    systemctl disable --now ygg-exitd-docker-fw.service >/dev/null 2>&1 || true
+    remove_docker_forwarding_rules
 
     systemctl disable --now "$SERVICE_NAME.service" >/dev/null 2>&1 || true
     log "Сервис остановлен и отключён, если существовал."
@@ -128,10 +178,11 @@ main() {
     remove_policy_routing
     remove_leftover_tun
 
-    rm -f "$SYSTEMD_UNIT"
+    rm -f "$SYSTEMD_UNIT" "$DOCKER_FW_UNIT"
     rm -f "$RUNNER_PATH"
     rm -f "$HELPER_APPLY_NFT" "$HELPER_REMOVE_NFT"
     rm -f "$HELPER_APPLY_ROUTING" "$HELPER_REMOVE_ROUTING"
+    rm -f "$HELPER_DOCKER_FW"
     rm -f "$SYSCTL_FILE"
     rm -f "$BIN_PATH"
 
@@ -149,6 +200,7 @@ main() {
 
     systemctl daemon-reload 2>/dev/null || true
     systemctl reset-failed "$SERVICE_NAME.service" 2>/dev/null || true
+    systemctl reset-failed ygg-exitd-docker-fw.service 2>/dev/null || true
 
     log "Удаление завершено."
 }
