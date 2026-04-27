@@ -250,10 +250,10 @@ write_whitelist_if_missing() {
 # ygg-exitd whitelist
 #
 # По умолчанию список пустой, поэтому ни один клиент не будет принят.
-# Добавь сюда Yggdrasil IPv6 клиентов, по одному адресу на строку.
+# Формат: <client-yggdrasil-ipv6> <client-inner-ipv4>
 #
 # Пример:
-# 200:1111:2222:3333:4444:5555:6666:7777
+# 200:1111:2222:3333:4444:5555:6666:7777 10.66.0.10
 EOF_WHITELIST
     chmod 0644 "$WHITELIST_FILE"
     log "Создан пустой whitelist: $WHITELIST_FILE"
