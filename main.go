@@ -26,6 +26,33 @@ type peerTable struct {
 	byInner map[string]*net.UDPAddr
 }
 
+type clientBindings struct {
+	byYgg   map[string]net.IP
+	byInner map[string]string
+}
+
+func normalizeIPv6(ip net.IP) (string, bool) {
+	if ip == nil || ip.To4() != nil {
+		return "", false
+	}
+	v6 := ip.To16()
+	if v6 == nil {
+		return "", false
+	}
+	return v6.String(), true
+}
+
+func normalizeIPv4(ip net.IP) (string, bool) {
+	if ip == nil {
+		return "", false
+	}
+	v4 := ip.To4()
+	if v4 == nil {
+		return "", false
+	}
+	return v4.String(), true
+}
+
 func newPeerTable() *peerTable {
 	return &peerTable{
 		byInner: make(map[string]*net.UDPAddr),
@@ -161,9 +188,9 @@ func ensureWhitelistConfig(path string) error {
 	}
 
 	const defaultConfig = `# ygg-exitd whitelist
-# One allowed client IPv6 address per line.
+# Format: <client-yggdrasil-ipv6> <client-inner-ipv4>
 # Example:
-# 200:1111:2222:3333:4444:5555:6666:7777
+# 200:1111:2222:3333:4444:5555:6666:7777 10.66.0.10
 `
 
 	if err := os.WriteFile(path, []byte(defaultConfig), 0644); err != nil {
@@ -174,14 +201,27 @@ func ensureWhitelistConfig(path string) error {
 	return nil
 }
 
-func loadWhitelist(path string) (map[string]struct{}, error) {
+func loadWhitelist(path, tunCIDR string) (*clientBindings, error) {
+	tunIP, tunNet, err := net.ParseCIDR(tunCIDR)
+	if err != nil {
+		return nil, fmt.Errorf("invalid --tun-cidr %q: %w", tunCIDR, err)
+	}
+	tunIP4 := tunIP.To4()
+	if tunIP4 == nil {
+		return nil, fmt.Errorf("invalid --tun-cidr %q: TUN IP must be IPv4", tunCIDR)
+	}
+
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open whitelist config failed: %w", err)
 	}
 	defer f.Close()
 
-	allowed := make(map[string]struct{})
+	bindings := &clientBindings{
+		byYgg:   make(map[string]net.IP),
+		byInner: make(map[string]string),
+	}
+
 	sc := bufio.NewScanner(f)
 	lineNo := 0
 	for sc.Scan() {
@@ -191,17 +231,76 @@ func loadWhitelist(path string) (map[string]struct{}, error) {
 			continue
 		}
 
-		ip := net.ParseIP(line)
-		if ip == nil || ip.To16() == nil || ip.To4() != nil {
-			return nil, fmt.Errorf("invalid IPv6 in whitelist at %s:%d: %q", path, lineNo, line)
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			return nil, fmt.Errorf("invalid whitelist entry at %s:%d: expected '<client-yggdrasil-ipv6> <client-inner-ipv4>', got %q", path, lineNo, line)
 		}
-		allowed[ip.To16().String()] = struct{}{}
+
+		yggIP := net.ParseIP(fields[0])
+		yggKey, ok := normalizeIPv6(yggIP)
+		if !ok {
+			return nil, fmt.Errorf("invalid client Yggdrasil IPv6 at %s:%d: %q", path, lineNo, fields[0])
+		}
+
+		innerIP := net.ParseIP(fields[1])
+		innerKey, ok := normalizeIPv4(innerIP)
+		if !ok {
+			return nil, fmt.Errorf("invalid client inner IPv4 at %s:%d: %q", path, lineNo, fields[1])
+		}
+		innerV4 := net.ParseIP(innerKey).To4()
+
+		if !tunNet.Contains(innerV4) {
+			return nil, fmt.Errorf("inner IPv4 %s at %s:%d is outside --tun-cidr %s", innerKey, path, lineNo, tunCIDR)
+		}
+		if innerV4.Equal(tunIP4) {
+			return nil, fmt.Errorf("inner IPv4 %s at %s:%d must not be equal to TUN interface address", innerKey, path, lineNo)
+		}
+		if _, exists := bindings.byYgg[yggKey]; exists {
+			return nil, fmt.Errorf("duplicate client Yggdrasil IPv6 %s at %s:%d", yggKey, path, lineNo)
+		}
+		if prevYgg, exists := bindings.byInner[innerKey]; exists {
+			return nil, fmt.Errorf("duplicate client inner IPv4 %s at %s:%d (already used by %s)", innerKey, path, lineNo, prevYgg)
+		}
+
+		bindings.byYgg[yggKey] = append(net.IP(nil), innerV4...)
+		bindings.byInner[innerKey] = yggKey
 	}
 	if err := sc.Err(); err != nil {
 		return nil, fmt.Errorf("read whitelist config failed: %w", err)
 	}
 
-	return allowed, nil
+	return bindings, nil
+}
+
+func packetAllowedForClient(addrIP net.IP, pkt []byte, bindings *clientBindings) (net.IP, bool) {
+	if bindings == nil {
+		return nil, false
+	}
+
+	yggKey, ok := normalizeIPv6(addrIP)
+	if !ok {
+		return nil, false
+	}
+
+	expectedInner, ok := bindings.byYgg[yggKey]
+	if !ok {
+		return nil, false
+	}
+
+	srcIP, _, ok := parsePacketIPs(pkt)
+	if !ok {
+		return nil, false
+	}
+
+	srcV4 := srcIP.To4()
+	if srcV4 == nil {
+		return nil, false
+	}
+	if !srcV4.Equal(expectedInner) {
+		return nil, false
+	}
+
+	return append(net.IP(nil), expectedInner...), true
 }
 
 func main() {
@@ -227,11 +326,11 @@ func main() {
 	if err := ensureWhitelistConfig(whitelistConfigPath); err != nil {
 		log.Fatalf("whitelist config setup failed: %v", err)
 	}
-	whitelist, err := loadWhitelist(whitelistConfigPath)
+	whitelist, err := loadWhitelist(whitelistConfigPath, tunCIDR)
 	if err != nil {
 		log.Fatalf("whitelist config load failed: %v", err)
 	}
-	log.Printf("whitelist loaded: %d client(s)", len(whitelist))
+	log.Printf("whitelist loaded: %d client(s)", len(whitelist.byYgg))
 
 	ifce, err := ensureTun(tunName, tunCIDR, tunMTU)
 	if err != nil {
@@ -283,23 +382,19 @@ func main() {
 				continue
 			}
 
-			addrIP := addr.IP.To16()
-			if addrIP == nil || addr.IP.To4() != nil {
+			addrIP := addr.IP
+			if _, ok := normalizeIPv6(addrIP); !ok {
 				log.Printf("ignoring non-IPv6 client %s", addr.String())
 				continue
 			}
-			if _, ok := whitelist[addrIP.String()]; !ok {
-				log.Printf("ignoring non-whitelisted client %s", addr.String())
-				continue
-			}
 
-			srcIP, _, ok := parsePacketIPs(buf[:n])
+			assignedInner, ok := packetAllowedForClient(addrIP, buf[:n], whitelist)
 			if !ok {
-				log.Printf("ignoring malformed IP packet from %s", addr.String())
+				log.Printf("ignoring packet from %s: client not allowed or source inner IP mismatch", addr.String())
 				continue
 			}
 
-			peerByInnerIP.Set(srcIP, addr)
+			peerByInnerIP.Set(assignedInner, addr)
 
 			_, err = ifce.Write(buf[:n])
 			if err != nil {
