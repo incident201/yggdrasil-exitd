@@ -312,7 +312,7 @@ func main() {
 	flag.StringVar(&listenAddr, "listen", "", "UDP listen address, e.g. [200:xxxx:....]:40001")
 	flag.StringVar(&tunName, "tun-name", "yggexit0", "TUN interface name")
 	flag.StringVar(&tunCIDR, "tun-cidr", "10.66.0.1/24", "CIDR address for TUN")
-	flag.IntVar(&tunMTU, "tun-mtu", 1500, "MTU for TUN interface")
+	flag.IntVar(&tunMTU, "tun-mtu", 1280, "MTU for TUN interface")
 	flag.Parse()
 
 	if listenAddr == "" {
