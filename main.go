@@ -390,7 +390,37 @@ func main() {
 
 			assignedInner, ok := packetAllowedForClient(addrIP, buf[:n], whitelist)
 			if !ok {
-				log.Printf("ignoring packet from %s: client not allowed or source inner IP mismatch", addr.String())
+				expected := "<none>"
+				if yggKey, yggOK := normalizeIPv6(addrIP); yggOK {
+					if expectedInner, exists := whitelist.byYgg[yggKey]; exists {
+						expected = expectedInner.String()
+					}
+				}
+
+				srcIP, dstIP, parsed := parsePacketIPs(buf[:n])
+				if parsed {
+					log.Printf(
+						"ignoring packet from %s: src=%s dst=%s expectedInner=%s ipVersion=%d len=%d",
+						addr.String(),
+						srcIP.String(),
+						dstIP.String(),
+						expected,
+						buf[0]>>4,
+						n,
+					)
+				} else {
+					firstByte := byte(0)
+					if n > 0 {
+						firstByte = buf[0]
+					}
+					log.Printf(
+						"ignoring packet from %s: malformed/non-IP packet expectedInner=%s len=%d firstByte=0x%02x",
+						addr.String(),
+						expected,
+						n,
+						firstByte,
+					)
+				}
 				continue
 			}
 
