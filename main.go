@@ -128,6 +128,13 @@ func parsePacketIPs(pkt []byte) (srcIP net.IP, dstIP net.IP, ok bool) {
 	}
 }
 
+func packetIPVersion(pkt []byte) int {
+	if len(pkt) < 1 {
+		return 0
+	}
+	return int(pkt[0] >> 4)
+}
+
 func run(cmd string, args ...string) error {
 	c := exec.Command(cmd, args...)
 	out, err := c.CombinedOutput()
@@ -390,6 +397,13 @@ func main() {
 
 			assignedInner, ok := packetAllowedForClient(addrIP, buf[:n], whitelist)
 			if !ok {
+				if packetIPVersion(buf[:n]) == 6 {
+					// ExitVPN currently supports IPv4 payload only.
+					// Android VPN may emit IPv6 link-local/multicast packets such as
+					// fe80::... -> ff02::2. They are expected and should be ignored silently.
+					continue
+				}
+
 				expected := "<none>"
 				if yggKey, yggOK := normalizeIPv6(addrIP); yggOK {
 					if expectedInner, exists := whitelist.byYgg[yggKey]; exists {
@@ -405,7 +419,7 @@ func main() {
 						srcIP.String(),
 						dstIP.String(),
 						expected,
-						buf[0]>>4,
+						packetIPVersion(buf[:n]),
 						n,
 					)
 				} else {
